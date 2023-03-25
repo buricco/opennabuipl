@@ -1,0 +1,1456 @@
+; ============================================================================
+; Copyright 2012, 2013, 2015, 2023 S. V. Nickolas.
+;
+; Permission is hereby granted, free of charge, to any person obtaining a copy
+; of this software and associated documentation files (the "Software"), to
+; deal in the Software without restriction, including without limitation the
+; rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+; sell copies of the Software, and to permit persons to whom the Software is
+; furnished to do so, subject to the following condition:  The above copyright
+; notice and this permission notice shall be included in all copies or
+; substantial portions of the Software.
+;
+; THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+; IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+; FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+; AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+; LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+; FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+; IN THE SOFTWARE.
+; ============================================================================
+
+; ============================================================================
+; OpenNabu IPL: Replacement for the Nabu Personal Computer firmware (mainly
+; for use by emulators, but works on metal also).  V0.6.2
+;
+; Space for a POST has been sacrificed in order to ensure that there is room
+; to boot either the floppy subsystem (if installed) or the cable modem.  It
+; is restricted to 4 KB so that no further modification is necessary to use it
+; on an actual Nabu.
+;
+; The VDP initialization and bell code is adapted from original 6502 code.
+;
+; The original author does not speak fluent Z80 (C, 6502, 8086), so the code
+; is non-native monkey code.
+;
+; This code is written for Debian's z80asm.
+;
+; Special thanks to those on the Nabu PC Discord who helped me figure out a
+; lot of this stuff - this would not be possible without you.
+;
+; THIS CODE WAS NOT CREATED THROUGH DISASSEMBLY OF THE ORIGINAL NABU PC
+; FIRMWARE (ANY VERSION THEREOF).  ONLY DATAMINING AND BLACK-BOX REVERSE
+; ENGINEERING WAS USED.
+; ----------------------------------------------------------------------------
+; For trademark reasons,
+;   the full official name of this program is "OpenNabu IPL".
+; ============================================================================
+
+; ============================================================================
+; Note that all of the memory addresses used by OpenNabu IPL are located at or
+; above FFE0.  FF80-FFDF is reserved for data which must be preserved across
+; reboots.
+; ============================================================================
+
+xoff:     equ       0xFFE0              ; Cursor X-position
+yoff:     equ       0xFFE1              ; Cursor Y-position (for scrolling)
+csrlin:   equ       0xFFE2              ; Address of current screen line
+csrchr:   equ       0xFFE4              ; Storage for char under cursor
+csrtick:  equ       0xFFE5              ; Internal counter
+
+iplmode:  equ       0xFFEC
+iplfdc:   equ       0xAA
+iplhdc:   equ       0xE8
+iplhcca:  equ       0x55
+
+warmflag: equ       0xFFFE
+warmlo:   equ       0xA5
+warmhi:   equ       0x5A
+
+; ============================================================================
+; Entry point from reset.
+; Skip over fixed vectors and jump to the next stage of the boot process.
+; ============================================================================
+
+          org       0x0000
+
+entry:    di                            ; Disable any existing IRQ handlers
+          jr        entry2
+
+; ============================================================================
+; Vectors to TTY functions.
+; These functions may be used if a program is willing to sacrifice the ROM
+; space underlying OpenNabu IPL, or to copy it to RAM.  They provide basic
+; terminal I/O.
+; ============================================================================
+
+vsetup:   jp        setup               ; 0003
+vgetch:   jp        getch               ; 0006
+vputch:   jp        putch               ; 0009
+vclrscr:  jp        clrscr              ; 000C
+vhtab:    jp        htab                ; 000F
+vvtab:    jp        vtab                ; 0012
+vbell:    jp        bell                ; 0015
+vgetln:   jp        getln               ; 0018
+vputln:   jp        putln               ; 001B
+
+; ============================================================================
+; Continue the boot process.
+; Shadow the boot ROM, set up the VDP, display the Nabu logo and proceed to
+; the IPL (initial program load).
+; ============================================================================
+
+entry2:   ld        hl, 0x0000          ; Shadow (or we exit to hyperspace)
+          ld        de, 0x0000
+          ld        bc, 0x1000
+          ldir
+
+          ld        sp, 0xFFE0
+          call      setup               ; Initialize TTY
+          call      bell                ; Ring the bell
+          call      wrbanner            ; Draw logo in the corner of the screen
+          ld        a, 7                ; Move cursor out of the way
+          call      vtab
+          ld        c, 0x91             ; Wait about half a second for <ESC>
+          xor       a
+          ld        d, a
+          ld        b, a
+entry3:   in        a, (c)              ; Poll keyboard
+          bit       1, a
+          jr        nz, entry5          ; Something was hit
+          djnz      entry3
+          dec       d
+          jr        nz, entry3
+entry4:   jp        bootany             ; Try each boot device in turn.
+
+          ds        6                   ; ???
+
+entry5:   dec       c                   ; Read the key
+          in        a, (c)
+          inc       c
+          cp        0x95                ; Reset code?
+          jr        z, entry3
+          cp        0x1B                ; ESC?
+          jr        nz, entry4          ; No, continue to normal boot process
+          call      setwarm
+          jp        menu                ; Yes, go to boot selector.
+
+; ============================================================================
+; TTY functions.  Most of them are vectored through the hooks above.
+; ============================================================================
+
+; ----------------------------------------------------------------------------
+; SETUP: Initialize TTY.
+; ----------------------------------------------------------------------------
+
+setup:    ld        c, 0x00             ; Bank out ROM, set only "Check" LED
+          ld        a, 0x0A
+          out       (c), a
+          call      keyreset
+          ld        hl, txtregs         ; Setup video mode
+          ld        d, 0x80
+          ld        b, 0x08
+          ld        c, 0xA1             ; VDP address register
+setup1:   ld        a, (hl)
+          out       (c), a
+          inc       hl
+          ld        a, d
+          out       (c), a
+          inc       d
+          djnz      setup1
+setup2:   ld        de, 0x4000          ; Flush video memory
+          xor       a                   ; Address 0x0000
+          out       (c), a
+          ld        a, 0x40
+          out       (c), a
+          dec       c                   ; VDP data register
+setup3:   xor       a
+          out       (c), a
+          dec       de                  ; Tick down
+          ld        a, d
+          or        e
+          jr        nz, setup3
+          inc       c                   ; VDP address register  Opt: A=0x00
+          out       (c), a
+          ld        a, 0x44             ; Address 0x0400
+          out       (c), a
+          dec       c                   ; VDP data register
+          ld        de, 0x0400
+          ld        hl, font
+setup4:   ld        a, (hl)             ; Zoom zoom zoom, capoeira mata um...
+          out       (c), a              ; (Sorry, not Mazda)
+          inc       hl
+          dec       de                  ; Tick down
+          ld        a, d
+          or        e
+          jr        nz, setup4
+          ld        c, 0x00             ; Turn off CHECK LED
+          ld        a, 0x02
+          out       (c), a              ; FALL INTO
+
+; ----------------------------------------------------------------------------
+; CLRSCR: Clear TTY.
+; ----------------------------------------------------------------------------
+
+clrscr:   push      af
+          push      bc
+          push      de
+clrscr2:  ld        c, 0xA1             ; VDP address register
+          xor       a                   ; Address 0x0800
+          out       (c), a
+          ld        a, 0x48
+          out       (c), a
+          dec       c                   ; VDP data register
+          ld        de, 960             ; DECIMAL
+clrscr3:  ld        a, ' '              ; Intentionally suboptimal
+          out       (c), a
+          dec       de                  ; Tick down
+          ld        a, d
+          or        e
+          jp        nz, clrscr3
+          pop       de
+          pop       bc
+          xor       a                   ; Prepare to home the cursor
+          ld        (xoff), a
+          jr        vtab2
+
+; ----------------------------------------------------------------------------
+; VTAB: Set cursor Y-position.  (Input in A)
+; ----------------------------------------------------------------------------
+
+vtab:     cp        24                  ; DECIMAL
+          ret       nc                  ; Bounds check
+          push      af
+vtab2:    push      hl                  ; Used by clrscr
+          ld        (yoff), a
+          ld        hl, linlut
+          or        a                   ; Clear carry
+          sla       a                   ; Double
+          add       a, l                ; No need to check carry, always <48
+          ld        l, a
+          ld        a, (hl)             ; Copy address of beginning of line.
+          ld        (csrlin), a
+          inc       hl
+          ld        a, (hl)
+          ld        (csrlin+1), a
+          pop       hl
+          pop       af
+          ret
+
+; ----------------------------------------------------------------------------
+; HTAB: Set cursor X-position.  (Input in A)
+; ----------------------------------------------------------------------------
+
+htab:     cp        40                  ; DECIMAL
+          ret       nc                  ; Bounds check
+          ld        (xoff), a
+          ret
+
+; ----------------------------------------------------------------------------
+; PUTCH: Write character to TTY.  (Input in A)
+; ----------------------------------------------------------------------------
+
+isff:     pop       hl                  ; Odd location allows us to jump short
+          jr        clrscr2
+putch:    push      af
+          push      bc
+          push      de
+          push      hl
+          cp        0x20                ; Control character?
+          jr        nc, putch3          ; No, writable
+putch2:   cp        0x07                ; BEL
+          jr        z, isbel
+          cp        0x08                ; BKSP
+          jr        z, isbs
+          cp        0x09                ; TAB
+          jr        z, istab
+          cp        0x0C                ; FF
+          jr        z, isff
+          cp        0x0A                ; LF
+          jr        z, lf
+          cp        0x0D                ; CR (also emits LF)
+          jr        z, iscr
+          jr        exfunc              ; Eat it
+putch3:   cp        0x80                ; Convert 80-9F to 00-1F.
+          jr        nc, putch4
+          cp        0xA0
+          jr        c, putch4
+          and       0x7F
+putch4:   ld        hl, (csrlin)        ; Find start of line
+          push      af
+          ld        a, (xoff)
+          ld        d, 0x00
+          ld        e, a
+          add       hl, de
+          ld        c, 0xA1             ; VDP address register
+          ld        a, l
+          out       (c), a
+          ld        a, h
+          or        0x40
+          out       (c), a
+          dec       c                   ; VDP data register
+          pop       af
+          xor       0x80
+          out       (c), a
+          ld        a, (xoff)           ; Check for wrap
+          inc       a
+          ld        (xoff), a
+          cp        40                  ; DECIMAL
+          jr        c, exfunc
+crlf:     xor       a                   ; Start a new line.
+          ld        (xoff), a           ; FALL INTO
+lf:       ld        a, (yoff)           ; Line feed.
+          inc       a
+          ld        (yoff), a
+          call      vtab
+          jr        c, exfunc
+          jr        scroll2
+exfunc:   pop       hl                  ; Exit putch function cleanly.
+          pop       de
+          pop       bc
+          pop       af
+          ret
+isbel:    call      bell                ; Beep, then exit cleanly.
+          jr        exfunc
+isbs:     ld        a, (xoff)           ; Backspace.
+          or        a                   ; Left?
+          jr        z, isbs2
+          dec       a
+          ld        (xoff), a
+          jr        exfunc
+isbs2:    ld        a, 39               ; DECIMAL
+          ld        (xoff), a
+          ld        a, (yoff)
+          or        a                   ; Top?
+          jr        z, exfunc
+          dec       a
+          call      vtab
+          jr        exfunc
+iscr:     xor       a                   ; Carriage return.
+          ld        (xoff), a
+          jr        exfunc
+istab:    ld        a, ' '              ; Tab.
+          call      putch
+          ld        a, (xoff)
+          and       0x07                ; X offset modulo 8 must be 1
+          dec       a
+          jr        z, exfunc           ; It is; exit.
+          jr        istab               ; Go back, Jack, and do it again
+
+; ----------------------------------------------------------------------------
+; Move the screen up a line, then write a blank line at the bottom.
+; At no point is the X-position touched.  This is easy since video memory on
+; the TMS-9918 is completely linear.
+; ----------------------------------------------------------------------------
+
+scroll:   push      af
+          push      bc
+          push      de
+          push      hl
+scroll2:  ld        de, 0x0828          ; $0800=first line, $0828=second line
+          ld        hl, 0x4800
+          ld        c, 0xA1             ; VDP address register
+scroll3:  ld        a, e                ; set read pointer
+          out       (c), a
+          ld        a, d
+          out       (c), a
+          or        a                   ; Kill a little time
+          dec       c                   ; VDP data register
+          in        a, (c)              ; get byte
+          inc       c                   ; VDP address register
+          ld        b, a
+          ld        a, l                ; set write pointer
+          out       (c), a
+          ld        a, h
+          out       (c), a
+          dec       c                   ; VDP data register
+          ld        a, b
+          out       (c), a              ; put byte
+          inc       c                   ; VDP address register
+          inc       de
+          inc       hl
+          ld        a, l                ; done yet? (write addr=$4B98)
+          cp        0x98
+          jr        nz, scroll3         ; keep going
+          ld        a, h
+          cp        0x4B
+          jr        nz, scroll3         ; keep going
+          ld        a, ' '              ; write row of spaces across bottom
+          ld        b, 40               ; DECIMAL
+          dec       c                   ; VDP data register
+scroll4:  or        a                   ; Kill a little time
+          out       (c), a
+          djnz      scroll4
+          pop       hl
+          pop       de
+          pop       bc
+          pop       af
+          ret
+
+; ----------------------------------------------------------------------------
+; GETCH: Read character from keyboard.  (Output in A)
+; Some of the slop in this function comes from it being originally written for
+; a font that had inverse on one half and normal on the other, rather than
+; normal on one half and blank on the other.  Instead, we use a fixed glyph
+; for the cursor (this has the side effect of making us kind-of look like the
+; Apple //e).
+; ----------------------------------------------------------------------------
+
+getch:    push      bc
+          push      de
+          push      hl
+          ld        hl, (csrlin)        ; Get char under cursor
+          ld        d, 0x00
+          ld        a, (xoff)
+          ld        e, a
+          add       hl, de
+          ld        c, 0xA1             ; VDP address register
+          ld        a, l
+          out       (c), a
+          ld        a, h
+          and       0x3F                ; Read address
+          out       (c), a
+          or        a                   ; Kill a little time
+          dec       c                   ; VDP data register
+          in        a, (c)
+          ld        (csrchr), a
+          ld        (csrtick), a
+getch1:   ld        c, 0xA1             ; VDP address register
+          ld        a, l
+          out       (c), a
+          ld        a, h
+          out       (c), a
+          dec       c                   ; VDP data register
+          ld        a, (csrtick)
+          xor       0x80                ; Invert
+          ld        (csrtick), a
+          bit       7, a                ; Cheap workaround to get block cursor
+          jr        z, getch2           ; in code that was not meant for it
+          ld        a, 0xFF
+getch2:   out       (c), a
+          ld        b, 0x00
+          ld        d, 0x80
+getch3:   ld        c, 0x91             ; Keyboard status register
+getch4:   in        a, (c)
+          and       0x02                ; RDRDY
+          jr        nz, getch5          ; We gotcha!
+          djnz      getch4              ; Tick down
+          dec       d
+          jp        nz, getch4
+          jr        getch1              ; Flash cursor
+getch5:   dec       c                   ; Keyboard data register
+          in        a, (c)
+          cp        0x90                ; Special flags (not keypress), ignore
+          jr        c, getch6
+          cp        0x96
+          jr        c, getch3
+getch6:   ld        b, a                ; Save keypress for now
+          ld        c, 0xA1             ; VDP address register
+          ld        a, l
+          out       (c), a
+          ld        a, h
+          out       (c), a
+          dec       c                   ; VDP data register
+          ld        a, (csrchr)         ; Erase cursor
+          out       (c), a              ; Retrieve keypress
+          ld        a, b
+          pop       hl
+          pop       de
+          pop       bc
+          ret
+
+; ----------------------------------------------------------------------------
+; BELL: Generate a simple beep through the AY-8910.
+; A lot of this is hand-translated 65C02 voodoo code from many moons ago.
+; Tone of 0x70 and Delay of 0x3000 seems to be comparable to an Apple ][ beep
+;   (1 kHz, 0.1 sec.)
+; ----------------------------------------------------------------------------
+
+bell:     push      af
+          push      bc
+          push      de
+          ld        c, 0x41
+          ld        a, 0x07
+          out       (c), a
+          ld        a, 0x3E             ; Output channel A
+          dec       c
+          out       (c), a
+          inc       c
+          xor       a
+          out       (c), a
+          dec       c
+          ld        a, 0x80             ; Tone
+          out       (c), a
+          inc       c
+          ld        a, 1
+          out       (c), a
+          dec       a
+          dec       c
+          out       (c), a
+          inc       c
+          ld        a, 0x08
+          out       (c), a
+          dec       c
+          ld        a, 0x0F             ; Volume max
+          out       (c), a
+          ld        de, 0x2000          ; Delay
+bell1:    dec       de                  ; Tick down
+          ld        a, d
+          or        e
+          jr        nz, bell1           ; Z when HL=0
+          ld        a, 0x08             ; Shut down the beeper
+          inc       c
+          out       (c), a
+          dec       c
+          xor       a
+          out       (c), a
+          pop       de
+          pop       bc
+          pop       af
+          ret
+
+; ----------------------------------------------------------------------------
+; PUTLN: Write a string to the screen.  (Input in HL)
+; ----------------------------------------------------------------------------
+
+putln:    push      af
+          push      hl
+putln1:   ld        a, (hl)             ; Start address
+          or        a                   ; Test for NUL terminator
+          jr        z, putln2
+          call      putch               ; Write character
+          inc       hl                  ; Nudge address
+          jr        putln1
+putln2:   pop       hl
+          pop       af
+          ret
+
+; ----------------------------------------------------------------------------
+; GETLN: Read a line from the keyboard.  (Operates at HL)
+; ----------------------------------------------------------------------------
+
+getln:    push      af
+          push      bc
+          push      hl
+getln2:   ld        b, 0x00
+          ld        c, 0x00
+          xor       a
+          ld        (hl), a
+getln3:   call      getch
+          cp        0x80
+          jr        nc, getln3
+          cp        0x0D                ; <Enter>
+          jr        z, getln4
+          cp        0x18                ; ^X
+          jr        z, cancel
+          cp        0x7F                ; Bksp
+          jr        z, del
+          ld        (hl), a
+          inc       bc
+          inc       hl
+          call      putch
+          jr        getln3
+getln4:   call      putch               ; CRLF
+          ld        a, 0x0A
+          call      putch
+          xor       a
+          ld        (hl), a
+          pop       hl                  ; Clean up and exit
+          pop       bc
+          pop       af
+          ret
+del:      ld        a, b                ; Beginning of line - ignore delete
+          or        c
+          jr        z, getln3
+          ld        a, 0x08             ; Stomp character
+          call      putch
+          ld        a, ' '
+          call      putch
+          ld        a, 0x08
+          call      putch
+          dec       bc
+          dec       hl
+          jp        getln3
+cancel:   ld        a, '\\'             ; Display \ at end of line.
+          call      putch
+          ld        a, 0x0D             ; CR
+          call      putch
+          ld        a, 0x0A             ; LF
+          call      putch
+          pop       hl
+          push      hl
+          jp        getln2
+
+; ----------------------------------------------------------------------------
+; Reset the keyboard.  Flash the Alert light during the process.
+; ----------------------------------------------------------------------------
+
+keyreset: ld        c, 0x00
+          ld        a, 0x12
+          out       (c), a
+          ld        c, 0x91
+          ld        b, 0x08
+          ld        hl, keyrest
+keyrest2: ld        a, (hl)
+          out       (c), a
+          inc       hl
+          djnz      keyrest2
+keyrest3: in        a, (c)              ; Eat first key, should be 0x95
+          and       0x02
+          jr        z, keyrest3
+          dec       c
+          in        a, (c)              ; Eat it, just eat it (am I Weird Al?)
+          ld        c, 0x00
+          ld        a, 0x02
+          out       (c), a
+          ret
+
+; ============================================================================
+; IPL support routines.
+; Not the actual IPL code, but the user interface to the IPL code.
+; ============================================================================
+
+; ----------------------------------------------------------------------------
+; Display a Nabu logo in the top right corner of the screen.
+; ----------------------------------------------------------------------------
+
+wrbanner: ld        c, 0xA1             ; VDP address register
+          ld        hl, addrtab
+          ld        de, strings
+.banner1: ld        a, (hl)             ; Address of next chunk
+          or        a
+          jr        z, .banner3         ; Done
+          out       (c), a              ; Write address to VDP
+          inc       hl                  
+          ld        a, 0x48
+          out       (c), a
+          ex        de, hl              ; strings table
+          ld        b, 0x08             ; 8 bytes to VDP
+          dec       c                   ; VDP data register
+.banner2: ld        a, (hl)
+          out       (c), a
+          inc       hl
+          djnz      .banner2
+          ex        de, hl              ; addresses table
+          inc       c                   ; VDP address register
+          jr        .banner1
+          
+.banner3: ld        a, 0xA0
+          out       (c), a
+          ld        a, 0x48
+          out       (c), a
+          ld        hl, banner
+          dec       c                   ; VDP data register
+.banner4: ld        a, (hl)
+          or        a
+          ret       z
+          xor       0x80
+          out       (c), a
+          inc       hl
+          jr        .banner4
+
+; ----------------------------------------------------------------------------
+; If cold boot: set warmboot flag, try all possible boot devices.
+; If we booted before, skip part of the process to save time.
+; ----------------------------------------------------------------------------
+
+bootany:  ld        a, (warmflag)       ; Warm boot?
+          cp        warmlo
+          jr        nz, bootany1        ; Nope, full check
+          ld        a, (warmflag+1)
+          cp        warmhi
+          jr        nz, bootany1        ; Nope, full check
+          ld        a, (iplmode)        ; Last device booted?
+          cp        iplfdc              ; Floppy disk?
+          jr        z, bootany2         ; Try floppy first.
+          cp        iplhdc              ; Winchester?
+          jr        z, bootany3         ; Skip floppy check.
+          cp        iplhcca             ; Cable?  If so, skip drive checks.
+          jr        z, bootany4         ; FALL INTO
+bootany1: call      setwarm
+bootany2: call      fdseek
+bootany3: call      hdseek
+bootany4: jp        tryhcca
+
+; ----------------------------------------------------------------------------
+; Cold boot POST: make sure the RAM is working, or die screaming.
+; ----------------------------------------------------------------------------
+
+setwarm:  ld        a, warmlo           ; Set warm boot flags.
+          ld        (warmflag), a
+          ld        a, warmhi
+          ld        (warmflag+1), a     ; FALL INTO
+testram:  xor       a
+          ld        c, a
+          ld        e, a
+          ld        h, a
+          ld        l, a
+          ld        d, 0x40
+testlo:   ld        a, 0x0A             ; Disabled error in this phase because
+          out       (c), a              ; MAME has a problem with what I'm
+          ld        b, (hl)             ; doing.  Check it anyway.
+          inc       a
+          out       (c), a
+          ld        a, (hl)
+          cp        b
+          nop
+          nop
+         ;jr        nz, ramderp
+          inc       hl
+          dec       de
+          ld        a, d
+          or        e
+          jr        nz, testlo
+          ld        hl, 0x4000
+testhi:   xor       a
+          ld        (hl), a
+          cp        (hl)
+          jr        nz, ramderp
+          dec       a
+          ld        (hl), a
+          cp        (hl)
+          jr        nz, ramderp
+          ld        a, 0x55
+          ld        (hl), a
+          cp        (hl)
+          jr        nz, ramderp
+          ld        a, 0xAA
+          ld        (hl), a
+          cp        (hl)
+          jr        nz, ramderp
+          inc       hl
+          ld        a, l
+          or        a
+          jr        nz, testhi
+          ld        a, h
+          inc       a
+          jr        nz, testhi
+          ld        a, 0x02
+          out       (c), a
+          ld        hl, ramok
+          jp        putln
+ramderp:  ld        hl, rammsg          ; "RAM failure"
+          call      putln               ; FALL INTO
+
+; ----------------------------------------------------------------------------
+; Flash the system LEDs forever.  Probably nothing left to optimize out.
+; ----------------------------------------------------------------------------
+
+rsod:     ld        c, 0xA1             ; VDP register
+          ld        a, 0xF6             ; White on red
+          out       (c), a
+          ld        a, 0x87
+          out       (c), a
+          ld        c, 0x00             ; Control register
+          ld        a, 0x02
+.rsod2:   xor       0x10                ; Flip the red light
+          out       (c), a
+.rsod3:   dec       d                   ; Deadwait (what reg, doesn't matter)
+          jr        nz, .rsod3
+          djnz      .rsod3
+          jr        .rsod2              ; Go back, Jack, and do it again
+
+; ----------------------------------------------------------------------------
+; Boot selector.
+; We come here either if <ESC> is pressed at startup, or all attempts to IPL
+; the system fail.  Let the user select boot from floppy disk, hard disk or
+; cable head end.
+; ----------------------------------------------------------------------------
+
+err:      ld        sp, 0xFFE0          ; Reset the stack.
+          ld        hl, errmsg
+          call      putln
+          call      bell                ; FALL INTO
+
+menu:     ld        hl, bootmsg
+          call      putln
+.menu1:   call      getch
+          cp        0x80                ; Ignore non-keys and special keys
+          jr        nc, .menu1
+          and       0x5F                ; Smash case
+          cp        'F'                 ; Floppy
+          jr        z, .menu2
+          cp        'H'                 ; Hard
+          jr        z, .menu3
+          cp        'C'                 ; Cable
+          jr        z, .menu4
+          call      bell
+          jr        .menu1
+.menu2:   call      .confirm
+          call      fdseek
+          jr        err
+.menu3:   call      .confirm
+          call      hdseek
+          jr        err
+.menu4:   call      .confirm
+          jp        tryhcca             ; Will fall into err anyway
+
+.confirm: call      putch               ; Display our choice
+          ld        a, 0x0D             ; Followed by a CRLF
+          call      putch
+          ld        a, 0x0A
+          jp        putch
+
+; ============================================================================
+; The Initial Program Loader (disk component).
+; getfd (floppy disk IPL) and gethd (hard disk IPL) will enter the next stage
+; bootloader at $C000 if successful, and return on failure.  See below for the
+; cable modem component.
+; ============================================================================
+
+; ----------------------------------------------------------------------------
+; Detect whether there is a floppy disk controller installed.
+; source: labomb on Nabu Discord (modified slightly)
+; ----------------------------------------------------------------------------
+
+getfd:    ld        c, 0xCF             ; Cx, Dx, Ex, Fx, each get 0x10 ports
+          ld        b, 4                ; 4 slots
+.getfd1:  in        a, (c)
+          cp        0x10                ; found FDC?
+          jr        z, .getfd2          ; mark it
+          ld        a, c
+          add       a, 0x10             ; next slot
+          ld        c, a
+          djnz      .getfd1             ; tick down
+          ld        b, a                ; Optimization: B=$00
+.getfd2:  ld        a, c
+          and       0xF0
+          ld        c, a
+          ret                           ; return A=C=base port or $00=none
+
+; ----------------------------------------------------------------------------
+; The same, for a Winchester controller.
+; ----------------------------------------------------------------------------
+
+gethd:    ld        c, 0xCF             ; Cx, Dx, Ex, Fx, each get 0x10 ports
+          ld        b, 4                ; 4 slots
+.gethd1:  in        a, (c)
+          cp        0xE8                ; found HDC?
+          jr        z, .gethd2          ; mark it
+          ld        a, c
+          add       a, 0x10             ; next slot
+          ld        c, a
+          djnz      .gethd1             ; tick down
+          ld        b, a                ; Optimization: B=$00
+.gethd2:  ld        a, c
+          and       0xF0
+          ld        c, a
+          ret                           ; return A=C=base port or $00=none
+
+; ----------------------------------------------------------------------------
+; Recalibrate the disk drive and read T0S1.
+; ----------------------------------------------------------------------------
+
+fdseek:   call      getfd
+          or        a
+          ret       z                   ; No drive
+          ld        a, iplfdc           ; Mark device
+          ld        (iplmode), a
+          ld        a, c
+          add       a, 0x0F             ; Select drive 1
+          ld        c, a
+          ld        a, 0x02
+          out       (c), a
+          ld        b, 0x05             ; Retry counter
+          ld        a, c
+          and       0xF0
+          ld        c, a
+          ld        de, 0x0000
+          ld        h, 0x0A
+.fdseek0: in        a, (c)              ; Wait a spell for INDEX to assert
+          bit       1, a
+          jr        nz, .fdseek1        ; Found it
+          dec       de                  ; Tick down
+          ld        a, d
+          or        e
+          jr        nz, .fdseek0
+          dec       h
+          jr        nz, .fdseek0
+          jr        drvfail             ; Time's up, commit sudoku
+.fdseek1: ld        a, c
+          and       0xF0
+          ld        c, a
+          ld        a, 0xD0             ; IRQ the drive
+          out       (c), a
+          call      fdwait
+          in        a, (c)              ; Check for errors
+          and       0x98
+          jp        nz, drvfail
+          ld        a, 0x07             ; RESTORE
+          out       (c), a
+          call      fdwait
+          ld        hl, 0xC000          ; Start address
+          in        a, (c)              ; Check for errors
+          and       0x98
+          jr        z, .fdseek2         ; OK, get ready to read
+          djnz      .fdseek1
+          jr        drvfail
+.fdseek2: inc       a                   ; Wait a spell before next command
+          jr        nz, .fdseek2
+          inc       c                   ; Track register - A=$00
+          out       (c), a
+          inc       a                   ; Sector 1
+          inc       c                   ; Sector register
+          out       (c), a
+          dec       c
+          dec       c                   ; Tick back down to command register
+          ld        a, 0x88
+          out       (c), a
+.fdseek3: in        a, (c)              ; Deadwait until DRQ asserted
+          bit       1, a
+          jr        z, .fdseek3
+          push      bc                  ; Kill some time
+          pop       bc
+
+; ----------------------------------------------------------------------------
+; Read sector.  Then check status.
+; ----------------------------------------------------------------------------
+
+.fdseek4: in        a, (c)              ; Wait until byte ready
+          or        a
+          jr        z, .fdseek5
+          bit       1, a
+          jr        z, .fdseek4
+          inc       c
+          inc       c
+          inc       c
+          in        a, (c)              ; Get it
+          ld        (hl), a             ; (you'd think inir would work, but
+          dec       c                   ;  it's WAY too fast)
+          dec       c
+          dec       c
+          inc       hl
+          jr        .fdseek4
+.fdseek5: and       0x18
+          jr        z, fdcmplt
+          djnz      .fdseek1            ; Error retry
+
+; ----------------------------------------------------------------------------
+; Error exit for the disk bootloader.  Shut off the drive and exit function.
+; ----------------------------------------------------------------------------
+
+drvfail:  ld        a, c                ; Shut off the drive
+          add       0x0F
+          ld        c, a
+          out       (c), 0
+          ret
+
+; ----------------------------------------------------------------------------
+; Boot was successful.
+; ----------------------------------------------------------------------------
+
+fdcmplt:  ld        a, c                ; Shut off the drive
+          add       a, 0x0F
+          ld        c, a
+          out       (c), 0
+          ld        c, 0x00             ; hide the ROM (we're under it still)
+          ld        a, 0x03             ;   (Nabu does this much sooner)
+          out       (c), a
+          jp        cleanup
+
+; ----------------------------------------------------------------------------
+; Function to wait until the disk controller is ready.
+; ----------------------------------------------------------------------------
+
+fdwait:   inc       c                   ; Status register
+          inc       c
+          inc       c
+.fdwait2: in        a, (c)
+          bit       0, a
+          jr        nz, .fdwait2
+          dec       c                   ; Data register
+          dec       c
+          dec       c
+fdret:    ret
+
+; ----------------------------------------------------------------------------
+; Set up the first Winchester controller, if present, and read the next stage.
+; ----------------------------------------------------------------------------
+
+hdseek:   call      gethd               ; Locate HD
+          or        a
+          ret       z                   ; Not found; return
+          ld        a, iplhdc           ; Mark device
+          ld        (iplmode), a
+          ld        a, c
+          call      hdset
+          ld        a, 0x15             ; Restore
+          out       (c), a
+          call      hdwait
+          ret       nz                  ; Error; return
+          call      hdset
+          ld        a, 0x75             ; Seek
+          out       (c), a
+          call      hdwait
+          ret       nz                  ; Error; return
+          call      hdset
+          ld        a, 0x20             ; Read sector
+          ld        hl, 0xC000          ; Prep for load
+          ld        de, 0x0200          ; 512 bytes
+          out       (c), a
+          call      hdwait
+          ret       nz
+          ld        a, c                ; Switch to data port
+          and       0xF0
+          ld        c, a
+.hdread:  in        a, (c)
+          ld        (hl), a
+          inc       hl                  ; Tick up
+          dec       de                  ; Tick down
+          ld        a, d                ; Done yet?
+          or        e
+          jr        nz, .hdread         ; Go back, Jack, and do it again
+          ld        a, c
+          add       0x07                ; Status
+          ld        c, a
+          call      hdwait
+          ret       nz                  ; Error; return
+
+; ----------------------------------------------------------------------------
+; Do a little cleanup for CP/M 3.1's sake and jump into the system.
+; ----------------------------------------------------------------------------
+
+cleanup:  ld        c, 0xA1             ; Write a few nulls to VDP memory
+          xor       a                   ; (because CP/M leaves them as-is,
+          out       (c), a              ;  resulting in visual corruption)
+          ld        a, 0x48
+          out       (c), a
+          xor       a
+          ld        b, 32
+          dec       c
+cleanup1: out       (c), a
+          djnz      cleanup1
+          ld        c, 0x00             ; Make sure ROM is banked out and
+          ld        a, 0x03             ; video output is enabled.
+          out       (c), a
+          jp        0xC000              ; WELCOMETOTHENEXTLEVEL
+
+; ----------------------------------------------------------------------------
+; Set up drive controller for next command.
+; ----------------------------------------------------------------------------
+
+hdset:    ld        a, c                ; Base port
+          and       0xF0
+          ld        c, a
+          inc       c
+          inc       c
+          ld        a, 0x01             ; One sector
+          out       (c), a
+          inc       c
+          xor       a
+          out       (c), a              ; Sector 0
+          inc       c
+          out       (c), a              ; Track 0 (lo)
+          inc       c
+          out       (c), a              ; Track 0 (hi)
+          inc       c
+          ld        a, 0x20             ; drive 0, head 0, 512 bytes
+          out       (c), a              ; Size/Drive/Head
+          inc       c                   ; Command register
+          ret
+
+; ----------------------------------------------------------------------------
+; Wait for drive to become ready, return error status as Z/NZ flag.
+; This code was pinched from brijohn's CP/M loader code.
+; ----------------------------------------------------------------------------
+
+hdwait:   in        a, (c)
+          bit       7, a                ; Busy?
+          jr        nz, hdwait          ; Set; keep waiting
+          bit       0, a                ; Error condition if nonzero
+          ret
+
+; ============================================================================
+; The Initial Program Loader (cable modem component).
+; Many error and continuity checks have been scuttled in the name of speed.
+; Pack $000001 is loaded into memory at address $140D, then entered at $1410,
+; as on the original firmware.
+; ============================================================================
+
+scream1:  jp        err
+
+tryhcca:  di                            ; uh, didn't we do this already?
+          call      inithcca
+
+; ----------------------------------------------------------------------------
+; Handshake complete; now demand payload.
+; Print a dot for each packet we attempt to load.
+; ----------------------------------------------------------------------------
+
+          ld        b, 0x00
+          ld        hl, 0x140D          ; payload address
+.getload: ld        a, '.'
+          call      putch
+          ld        a, 0x84
+          call      wrhcca
+          call      rdhcca
+          cp        0x10                ; command
+          jr        nz, scream1
+          call      rdhcca
+          cp        0x06                ; ack
+          jr        nz, scream1
+          ld        a, b                ; segment
+          call      wrhcca
+          ld        a, 0x01
+          call      wrhcca              ; pack 000001 (byte 1)
+          xor       a
+          call      wrhcca              ;             (byte 2)
+          call      wrhcca              ;             (byte 3)
+          call      rdhcca
+          cp        0xE4                ; confirm
+          jr        nz, scream1
+          call      rdhcca
+          cp        0x91                ; auth. (90=access denied)
+          jr        nz, scream1
+          ld        a, 0x10             ; command
+          call      wrhcca
+          ld        a, 0x06             ; ack
+          call      wrhcca
+
+; ----------------------------------------------------------------------------
+; Header.  Minimal error checking.
+; ----------------------------------------------------------------------------
+
+          call      xrdhcca             ; High byte of pack number - $00
+          call      xrdhcca             ; Middle byte of pack number - $00
+          call      xrdhcca             ; Low byte of pack number - $01
+          call      xrdhcca             ; Segment number
+          call      xrdhcca             ; 0x01
+          call      xrdhcca             ; 0x7F
+          call      xrdhcca             ; 0xFF
+          call      xrdhcca             ; 0xFF
+          call      xrdhcca             ; 0xFF
+          call      xrdhcca             ; 0x7F
+          call      xrdhcca             ; 0x80
+          call      xrdhcca
+          ld        (0x1000), a         ; bit 4, a will be NZ if done
+          call      xrdhcca             ; Segment, eat
+          call      xrdhcca
+          call      xrdhcca             ; Offset, eat
+          call      xrdhcca
+          call      rdhcca2
+          dec       hl                  ; Ignore checksum
+          dec       hl
+          ld        a, (0x1000)
+          bit       4, a                ; EOF?
+          jr        nz, hccmplt
+          inc       b
+          jp        .getload
+
+hccmplt:  ld        c, 0x00             ; Hide the ROM (we're under it still)
+          ld        a, 0x03             ;   (Nabu does this much sooner)
+          out       (c), a
+          jp        0x1410              ; Enter boot sector
+
+scream2:  jp        err
+
+; ----------------------------------------------------------------------------
+; Set up to read from the cable modem.
+; ----------------------------------------------------------------------------
+
+inithcca: ld        c, 0x41             ; PSG register
+          ld        a, 0x07             ; We need to be able to see IRQs from
+          out       (c), a              ;   the modem
+          dec       c                   ; Data
+          ld        a, c                ; Optimization: C=$40
+          out       (c), a
+          inc       c
+          ld        a, 0x0E
+          out       (c), a
+          dec       c
+          ld        a, 0xC0             ; IRQ lines 6 and 7
+          out       (c), a
+          inc       c
+          ld        a, 0x0F
+          out       (c), a
+          ret
+
+xrdhcca:  call      rdhcca              ; Modified version that discards 0x10
+          cp        0x10                ;   (doesn't care the next byte)
+          ret       nz                  ; FALL INTO
+rdhcca:   ld        c, 0x40
+          ld        de, 0x0000
+          push      bc
+          ld        b, 0x08
+.rdpoll:  in        a, (c)
+          bit       0, a                ; IRQ waiting?
+          jr        z, .rdpoll          ; No, keep polling
+          bit       1, a                ; Read or write?
+          jr        z, .rdok
+          dec       de                  ; Not yet, wait a spell
+          ld        a, d
+          or        e
+          jr        nz, .rdpoll
+          djnz      .rdpoll
+          jp        err                 ; Time's up, die screaming
+.rdok:    ld        c, 0x80
+          in        a, (c)
+          pop       bc
+          ret
+
+wrhcca:   ld        c, 0x40
+          ld        de, 0x0000
+          push      bc
+          push      af
+          ld        b, 0x08
+.wrpoll:  in        a, (c)
+          bit       0, a                ; IRQ waiting?
+          jr        z, .wrpoll          ; No, keep polling
+          bit       1, a                ; Read or write?
+          jr        nz, .wrok
+          dec       de
+          ld        a, d
+          or        e
+          jr        nz, .wrpoll
+          djnz      .rdpoll
+          jp        err
+.wrok:    pop       af
+          ld        c, 0x80
+          out       (c), a
+          pop       bc
+          ret
+
+; ----------------------------------------------------------------------------
+; Read block faster (partially unrolled loop).
+; ----------------------------------------------------------------------------
+
+rdhcca2:  push      bc                  ; Save retry count
+.rdnext:  ld        c, 0x40
+          ld        de, 0x0000
+          ld        b, 0x08
+.rdpoll2: in        a, (c)
+          bit       0, a                ; IRQ waiting?
+          jr        z, .rdpoll2         ; No, keep polling
+          bit       1, a                ; Read or write?
+          jr        z, .rdok2
+          dec       de                  ; Not yet, wait a spell
+          ld        a, d
+          or        e
+          jr        nz, .rdpoll2
+          djnz      .rdpoll2
+          jp        err                 ; Time's up, die screaming
+.rdok2:   ld        c, 0x80
+          in        a, (c)
+          cp        0x10
+          jr        z, .rdesc
+.gotbyt:  ld        (hl), a
+          inc       hl
+          jr        .rdnext
+.rdesc:   ld        c, 0x40
+          ld        de, 0x0000
+          ld        b, 0x08
+.rdpoll3: in        a, (c)
+          bit       0, a                ; IRQ waiting?
+          jr        z, .rdpoll3         ; No, keep polling
+          bit       1, a                ; Read or write?
+          jr        z, .rdok3
+          dec       de                  ; Not yet, wait a spell
+          ld        a, d
+          or        e
+          jr        nz, .rdpoll3
+          djnz      .rdpoll3
+          jp        err                 ; Time's up, die screaming
+.rdok3:   ld        c, 0x80
+          in        a, (c)
+          cp        0x10
+          jr        z, .gotbyt
+          pop       bc                  ; Restore retry count
+          cp        0xE1                ; End of packet
+          ret       z
+          jp        err
+
+banner:   db        "OpenNabu IPL v0.6.2 25-MAR-23", 0
+bootmsg:  db        13, 10
+          db        "Select boot device", 13, 10
+          db        "[(F)loppy disk, (H)ard disk, (C)able]: ", 0
+errmsg:   db        13, 10
+          db        "Boot failed", 13, 10, 0
+ramok:    db        "64K OK", 13, 10, 0
+rammsg:   db        "RAM failure", 7, 0
+
+; ============================================================================
+; Constant data at the top of memory.  None of this should be touched.
+; When running from RAM it is generally safe to scotch memory from $0C00 up,
+; with the proviso that the SETUP call will no longer be able to properly load
+; the system font.
+; ============================================================================
+
+          ds        0x0B70-$
+
+; ----------------------------------------------------------------------------
+; Copyright message (32 bytes).
+; ----------------------------------------------------------------------------
+
+          db        "(C) S. V. Nickolas 2012-2023 ", 13, 10, 0
+
+; ----------------------------------------------------------------------------
+; VDP addresses at which to generate the Nabu logo (low byte only).
+; Zero-terminated and padded to a multiple of 8.  The top byte is always 0x48.
+; ----------------------------------------------------------------------------
+
+addrtab:  db        0x20, 0x48, 0x70, 0x98, 0xC0, 0x00, 0x00, 0x00
+
+; ----------------------------------------------------------------------------
+; Character data for the Nabu logo.  Glyph data is in the font (see below).
+; ----------------------------------------------------------------------------
+
+strings:  db        0x80, 0x81, 0x82, 0x82, 0x82, 0x82, 0x83, 0x84
+          db        0x85, 0x86, 0x87, 0x88, 0x89, 0x8A, 0x8A, 0x8B
+          db        0x8C, 0x8D, 0x8E, 0x8F, 0x90, 0x91, 0x92, 0x93
+          db        0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x98, 0x9A
+          db        0x9B, 0x9C, 0x9D, 0x9D, 0x9D, 0x9D, 0x9E, 0x9F
+
+; ----------------------------------------------------------------------------
+; Line lookup table.  Could be done with multiplication, but this is quicker.
+; ----------------------------------------------------------------------------
+
+linlut:   dw        0x4800, 0x4828, 0x4850, 0x4878, 0x48A0, 0x48C8
+          dw        0x48F0, 0x4918, 0x4940, 0x4968, 0x4990, 0x49B8
+          dw        0x49E0, 0x4A08, 0x4A30, 0x4A58, 0x4A80, 0x4AA8
+          dw        0x4AD0, 0x4AF8, 0x4B20, 0x4B48, 0x4B70, 0x4B98
+
+; ----------------------------------------------------------------------------
+; Keyboard reset data.
+; A few nulls, then reset the keyboard and set the serial line to 9600N81
+; ---------------------------------------------------------------------------
+
+keyrest:  db        0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x4E, 0x04
+
+; ----------------------------------------------------------------------------
+; TMS-9918 registers to configure the 40x24 text mode.  Last byte is color.
+; ----------------------------------------------------------------------------
+
+txtregs:  db        0x00, 0xD0, 0x02, 0x00, 0x00, 0x20, 0x00, 0xF5
+
+; ----------------------------------------------------------------------------
+; A basic 6x8 TTY font.  The Nabu logo is compressed into the first 32 glyphs.
+; ----------------------------------------------------------------------------
+
+font:     db        0x00, 0x00, 0x00, 0x04, 0x00, 0x1C, 0x3C, 0x00    ; Logo
+          db        0x00, 0x0C, 0x00, 0xFC, 0x00, 0xFC, 0xFC, 0x00    ; Logo
+          db        0x00, 0xFC, 0x00, 0xFC, 0x00, 0xFC, 0xFC, 0x00    ; Logo
+          db        0x00, 0xC0, 0x00, 0xFC, 0x00, 0xFC, 0xFC, 0x00    ; Logo
+          db        0x00, 0x00, 0x00, 0x80, 0x00, 0xE0, 0xF0, 0x00    ; Logo
+          db        0x7C, 0xFC, 0xFC, 0x00, 0xFC, 0xFC, 0xFC, 0xF0    ; Logo
+          db        0xFC, 0xFC, 0xFC, 0x00, 0xFC, 0xFC, 0xFC, 0xF8    ; Logo
+          db        0xFC, 0xFC, 0xFC, 0x00, 0xFC, 0xFC, 0xFC, 0x7C    ; Logo
+          db        0xFC, 0xFC, 0xFC, 0x00, 0xFC, 0xFC, 0xFC, 0x1C    ; Logo
+          db        0xFC, 0xFC, 0xFC, 0x00, 0xFC, 0xFC, 0xFC, 0xC0    ; Logo
+          db        0xFC, 0xFC, 0xFC, 0x00, 0xFC, 0xFC, 0xFC, 0x3C    ; Logo
+          db        0xF8, 0xFC, 0xFC, 0x00, 0xFC, 0xFC, 0xFC, 0x3C    ; Logo
+          db        0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0, 0xF0    ; Logo
+          db        0xF8, 0x78, 0x38, 0x98, 0xC8, 0xE0, 0xF0, 0xF8    ; Logo
+          db        0x78, 0x70, 0x60, 0x64, 0x60, 0x60, 0x64, 0x64    ; Logo
+          db        0x0C, 0x44, 0xE0, 0xF0, 0x00, 0x00, 0xF0, 0xF0    ; Logo
+          db        0xC0, 0xCC, 0xCC, 0xC0, 0xC0, 0xCC, 0xCC, 0xC0    ; Logo
+          db        0x1C, 0x8C, 0x8C, 0x1C, 0x1C, 0x8C, 0x8C, 0x1C    ; Logo
+          db        0x3C, 0x3C, 0x3C, 0x3C, 0x3C, 0x3C, 0x18, 0x80    ; Logo
+          db        0x3C, 0x3C, 0x3C, 0x3C, 0x3C, 0x3C, 0x3C, 0x7C    ; Logo
+          db        0xF0, 0xFC, 0xFC, 0xFC, 0x00, 0xFC, 0xFC, 0x7C    ; Logo
+          db        0xF8, 0xFC, 0xFC, 0xFC, 0x00, 0xFC, 0xFC, 0xFC    ; Logo
+          db        0x64, 0xFC, 0xFC, 0xFC, 0x00, 0xFC, 0xFC, 0xFC    ; Logo
+          db        0xF0, 0xFC, 0xFC, 0xFC, 0x00, 0xFC, 0xFC, 0xFC    ; Logo
+          db        0xC0, 0xFC, 0xFC, 0xFC, 0x00, 0xFC, 0xFC, 0xFC    ; Logo
+          db        0x3C, 0xFC, 0xFC, 0xFC, 0x00, 0xFC, 0xFC, 0xFC    ; Logo
+          db        0xFC, 0xFC, 0xFC, 0xFC, 0x00, 0xFC, 0xFC, 0xF8    ; Logo
+          db        0x00, 0x3C, 0x1C, 0x00, 0x04, 0x00, 0x00, 0x00    ; Logo
+          db        0x00, 0xFC, 0xFC, 0x00, 0xFC, 0x00, 0x0C, 0x00    ; Logo
+          db        0x00, 0xFC, 0xFC, 0x00, 0xFC, 0x00, 0xFC, 0x00    ; Logo
+          db        0x00, 0xFC, 0xFC, 0x00, 0xFC, 0x00, 0xC0, 0x00    ; Logo
+          db        0x00, 0xF0, 0xE0, 0x00, 0x80, 0x00, 0x00, 0x00    ; Logo
+          db        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00    ; ' '
+          db        0x20, 0x20, 0x20, 0x20, 0x20, 0x00, 0x20, 0x00    ; '!'
+          db        0x28, 0x28, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00    ; '"'
+          db        0x50, 0x50, 0xF8, 0x50, 0xF8, 0x50, 0x50, 0x00    ; '#'
+          db        0x20, 0x70, 0x80, 0x70, 0x08, 0x70, 0x20, 0x00    ; '$'
+          db        0x00, 0x88, 0x10, 0x20, 0x40, 0x88, 0x00, 0x00    ; '%'
+          db        0x40, 0xA0, 0xA0, 0x48, 0xB0, 0x90, 0x68, 0x00    ; '&'
+          db        0x20, 0x20, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00    ; '
+          db        0x10, 0x20, 0x40, 0x40, 0x40, 0x20, 0x10, 0x00    ; '('
+          db        0x40, 0x20, 0x10, 0x10, 0x10, 0x20, 0x40, 0x00    ; ')'
+          db        0x20, 0xA8, 0x70, 0x20, 0x70, 0xA8, 0x20, 0x00    ; '*'
+          db        0x00, 0x20, 0x20, 0xF8, 0x20, 0x20, 0x00, 0x00    ; '+'
+          db        0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x20, 0x40    ; ','
+          db        0x00, 0x00, 0x00, 0x70, 0x00, 0x00, 0x00, 0x00    ; '-'
+          db        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00    ; '.'
+          db        0x00, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x00    ; '/'
+          db        0x70, 0x88, 0x98, 0xA8, 0xC8, 0x88, 0x70, 0x00    ; '0'
+          db        0x20, 0x60, 0x20, 0x20, 0x20, 0x20, 0x70, 0x00    ; '1'
+          db        0x70, 0x88, 0x08, 0x30, 0x40, 0x80, 0xF8, 0x00    ; '2'
+          db        0x70, 0x88, 0x08, 0x30, 0x08, 0x88, 0x70, 0x00    ; '3'
+          db        0x10, 0x30, 0x50, 0x90, 0xF8, 0x10, 0x10, 0x00    ; '4'
+          db        0xF8, 0x80, 0xF0, 0x08, 0x08, 0x88, 0x70, 0x00    ; '5'
+          db        0x30, 0x40, 0x80, 0xF0, 0x88, 0x88, 0x70, 0x00    ; '6'
+          db        0xF8, 0x08, 0x10, 0x20, 0x40, 0x40, 0x40, 0x00    ; '7'
+          db        0x70, 0x88, 0x88, 0x70, 0x88, 0x88, 0x70, 0x00    ; '8'
+          db        0x70, 0x88, 0x88, 0x78, 0x08, 0x10, 0x60, 0x00    ; '9'
+          db        0x00, 0x00, 0x00, 0x20, 0x00, 0x20, 0x00, 0x00    ; ':'
+          db        0x00, 0x00, 0x00, 0x20, 0x00, 0x20, 0x20, 0x40    ; ';'
+          db        0x10, 0x20, 0x40, 0x80, 0x40, 0x20, 0x10, 0x00    ; '<'
+          db        0x00, 0x00, 0x00, 0xF8, 0x00, 0xF8, 0x00, 0x00    ; '='
+          db        0x80, 0x40, 0x20, 0x10, 0x20, 0x40, 0x80, 0x00    ; '>'
+          db        0x70, 0x88, 0x10, 0x20, 0x20, 0x00, 0x20, 0x00    ; '?'
+          db        0x70, 0x88, 0x88, 0xB8, 0xB8, 0x80, 0x70, 0x00    ; '@'
+          db        0x20, 0x50, 0x88, 0x88, 0xF8, 0x88, 0x88, 0x00    ; 'A'
+          db        0xF0, 0x88, 0x88, 0xF0, 0x88, 0x88, 0xF0, 0x00    ; 'B'
+          db        0x70, 0x88, 0x80, 0x80, 0x80, 0x88, 0x70, 0x00    ; 'C'
+          db        0xF0, 0x88, 0x88, 0x88, 0x88, 0x88, 0xF0, 0x00    ; 'D'
+          db        0xF8, 0x80, 0x80, 0xF0, 0x80, 0x80, 0xF8, 0x00    ; 'E'
+          db        0xF8, 0x80, 0x80, 0xF0, 0x80, 0x80, 0x80, 0x00    ; 'F'
+          db        0x70, 0x88, 0x80, 0x98, 0x88, 0x88, 0x78, 0x00    ; 'G'
+          db        0x88, 0x88, 0x88, 0xF8, 0x88, 0x88, 0x88, 0x00    ; 'H'
+          db        0x70, 0x20, 0x20, 0x20, 0x20, 0x20, 0x70, 0x00    ; 'I'
+          db        0x08, 0x08, 0x08, 0x08, 0x88, 0x88, 0x70, 0x00    ; 'J'
+          db        0x88, 0x90, 0xA0, 0xC0, 0xA0, 0x90, 0x88, 0x00    ; 'K'
+          db        0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0xF8, 0x00    ; 'L'
+          db        0x88, 0xD8, 0xA8, 0xA8, 0x88, 0x88, 0x88, 0x00    ; 'M'
+          db        0x88, 0x88, 0xC8, 0xA8, 0x98, 0x88, 0x88, 0x00    ; 'N'
+          db        0x70, 0x88, 0x88, 0x88, 0x88, 0x88, 0x70, 0x00    ; 'O'
+          db        0xF0, 0x88, 0x88, 0xF0, 0x80, 0x80, 0x80, 0x00    ; 'P'
+          db        0x70, 0x88, 0x88, 0x88, 0x88, 0x90, 0x68, 0x00    ; 'Q'
+          db        0xF0, 0x88, 0x88, 0xF0, 0xA0, 0x90, 0x88, 0x00    ; 'R'
+          db        0x70, 0x88, 0x80, 0x70, 0x08, 0x88, 0x70, 0x00    ; 'S'
+          db        0xF8, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x00    ; 'T'
+          db        0x88, 0x88, 0x88, 0x88, 0x88, 0x88, 0x70, 0x00    ; 'U'
+          db        0x88, 0x88, 0x88, 0x88, 0x88, 0x50, 0x20, 0x00    ; 'V'
+          db        0x88, 0x88, 0x88, 0xA8, 0xA8, 0xD8, 0x88, 0x00    ; 'W'
+          db        0x88, 0x88, 0x50, 0x20, 0x50, 0x88, 0x88, 0x00    ; 'X'
+          db        0x88, 0x88, 0x88, 0x50, 0x20, 0x20, 0x20, 0x00    ; 'Y'
+          db        0xF8, 0x08, 0x10, 0x20, 0x40, 0x80, 0xF8, 0x00    ; 'Z'
+          db        0xF8, 0xC0, 0xC0, 0xC0, 0xC0, 0xC0, 0xF8, 0x00    ; '['
+          db        0x00, 0x80, 0x40, 0x20, 0x10, 0x08, 0x04, 0x00    ; '\'
+          db        0xF8, 0x18, 0x18, 0x18, 0x18, 0x18, 0xF8, 0x00    ; ']'
+          db        0x20, 0x50, 0x88, 0x00, 0x00, 0x00, 0x00, 0x00    ; '^'
+          db        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFC    ; '_'
+          db        0x40, 0x20, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00    ; '`'
+          db        0x00, 0x00, 0x70, 0x08, 0x78, 0x88, 0x78, 0x00    ; 'a'
+          db        0x80, 0x80, 0xB0, 0xC8, 0x88, 0x88, 0xF0, 0x00    ; 'b'
+          db        0x00, 0x00, 0x70, 0x88, 0x80, 0x88, 0x70, 0x00    ; 'c'
+          db        0x08, 0x08, 0x68, 0x98, 0x88, 0x88, 0x78, 0x00    ; 'd'
+          db        0x00, 0x00, 0x70, 0x88, 0xF8, 0x80, 0x78, 0x00    ; 'e'
+          db        0x30, 0x48, 0x40, 0xE0, 0x40, 0x40, 0x40, 0x00    ; 'f'
+          db        0x00, 0x00, 0x78, 0x88, 0x88, 0x78, 0x08, 0x70    ; 'g'
+          db        0x80, 0x80, 0xB0, 0xC8, 0x88, 0x88, 0x88, 0x00    ; 'h'
+          db        0x20, 0x00, 0x60, 0x20, 0x20, 0x20, 0x20, 0x00    ; 'i'
+          db        0x08, 0x00, 0x18, 0x08, 0x08, 0x08, 0x88, 0x70    ; 'j'
+          db        0x80, 0x80, 0x88, 0x90, 0xE0, 0x90, 0x88, 0x00    ; 'k'
+          db        0x60, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x00    ; 'l'
+          db        0x00, 0x00, 0x88, 0xD8, 0xA8, 0x88, 0x88, 0x00    ; 'm'
+          db        0x00, 0x00, 0x70, 0x88, 0x88, 0x88, 0x88, 0x00    ; 'n'
+          db        0x00, 0x00, 0x70, 0x88, 0x88, 0x88, 0x70, 0x00    ; 'o'
+          db        0x00, 0x00, 0xB0, 0xC8, 0x88, 0xF0, 0x80, 0x80    ; 'p'
+          db        0x00, 0x00, 0x68, 0x98, 0x88, 0x78, 0x08, 0x08    ; 'q'
+          db        0x00, 0x00, 0x70, 0x88, 0x80, 0x80, 0x80, 0x00    ; 'r'
+          db        0x00, 0x00, 0x78, 0x80, 0x70, 0x08, 0xF0, 0x00    ; 's'
+          db        0x40, 0x40, 0xE0, 0x40, 0x40, 0x48, 0x30, 0x00    ; 't'
+          db        0x00, 0x00, 0x88, 0x88, 0x88, 0x98, 0x68, 0x00    ; 'u'
+          db        0x00, 0x00, 0x88, 0x88, 0x88, 0x50, 0x20, 0x00    ; 'v'
+          db        0x00, 0x00, 0x88, 0x88, 0xA8, 0xD8, 0x88, 0x00    ; 'w'
+          db        0x00, 0x00, 0x88, 0x50, 0x20, 0x50, 0x88, 0x00    ; 'x'
+          db        0x00, 0x00, 0x88, 0x88, 0x88, 0x78, 0x08, 0x70    ; 'y'
+          db        0x00, 0x00, 0xF8, 0x10, 0x20, 0x40, 0xF8, 0x00    ; 'z'
+          db        0x30, 0x60, 0x60, 0xC0, 0x60, 0x60, 0x30, 0x00    ; '{'
+          db        0x20, 0x20, 0x20, 0x00, 0x20, 0x20, 0x20, 0x00    ; '|'
+          db        0x60, 0x30, 0x30, 0x18, 0x30, 0x30, 0x60, 0x00    ; '}'
+          db        0x68, 0xB0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00    ; '~'
+          db        0x00, 0xA8, 0x50, 0xA8, 0x50, 0xA8, 0x00, 0x00    ; Cursor
