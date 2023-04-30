@@ -21,7 +21,7 @@
 
 ; ============================================================================
 ; OpenNabu IPL: Replacement for the Nabu Personal Computer firmware (mainly
-; for use by emulators, but works on metal also).  V0.6.2
+; for use by emulators, but works on metal also).  V0.6.3
 ;
 ; Space for a POST has been sacrificed in order to ensure that there is room
 ; to boot either the floppy subsystem (if installed) or the cable modem.  It
@@ -144,7 +144,7 @@ entry5:   dec       c                   ; Read the key
 ; ----------------------------------------------------------------------------
 
 setup:    ld        c, 0x00             ; Bank out ROM, set only "Check" LED
-          ld        a, 0x0A
+          ld        a, 0x0B
           out       (c), a
           call      keyreset
           ld        hl, txtregs         ; Setup video mode
@@ -185,7 +185,7 @@ setup4:   ld        a, (hl)             ; Zoom zoom zoom, capoeira mata um...
           or        e
           jr        nz, setup4
           ld        c, 0x00             ; Turn off CHECK LED
-          ld        a, 0x02
+          ld        a, 0x03
           out       (c), a              ; FALL INTO
 
 ; ----------------------------------------------------------------------------
@@ -586,7 +586,7 @@ cancel:   ld        a, '\\'             ; Display \ at end of line.
 ; ----------------------------------------------------------------------------
 
 keyreset: ld        c, 0x00
-          ld        a, 0x12
+          ld        a, 0x13
           out       (c), a
           ld        c, 0x91
           ld        b, 0x08
@@ -601,7 +601,7 @@ keyrest3: in        a, (c)              ; Eat first key, should be 0x95
           dec       c
           in        a, (c)              ; Eat it, just eat it (am I Weird Al?)
           ld        c, 0x00
-          ld        a, 0x02
+          ld        a, 0x03
           out       (c), a
           ret
 
@@ -742,7 +742,7 @@ rsod:     ld        c, 0xA1             ; VDP register
           ld        a, 0x87
           out       (c), a
           ld        c, 0x00             ; Control register
-          ld        a, 0x02
+          ld        a, 0x03
 .rsod2:   xor       0x10                ; Flip the red light
           out       (c), a
 .rsod3:   dec       d                   ; Deadwait (what reg, doesn't matter)
@@ -1259,7 +1259,7 @@ rdhcca2:  push      bc                  ; Save retry count
           ret       z
           jp        err
 
-banner:   db        "OpenNabu IPL v0.6.2 25-MAR-23", 0
+banner:   db        "OpenNabu IPL v0.6.3 30-APR-23", 0
 bootmsg:  db        13, 10
           db        "Select boot device", 13, 10
           db        "[(F)loppy disk, (H)ard disk, (C)able]: ", 0
