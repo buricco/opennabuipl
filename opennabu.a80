@@ -21,7 +21,7 @@
 
 ; ============================================================================
 ; OpenNabu IPL: Replacement for the Nabu Personal Computer firmware (mainly
-; for use by emulators, but works on metal also).  V0.6.4
+; for use by emulators, but works on metal also).  V0.6.5
 ;
 ; Space for a POST has been sacrificed in order to ensure that there is room
 ; to boot either the floppy subsystem (if installed) or the cable modem.  It
@@ -910,10 +910,10 @@ fdseek:   call      getfd
 ; ----------------------------------------------------------------------------
 
 .fdseek4: in        a, (c)              ; Wait until byte ready
-          or        a
-          jr        z, .fdseek5
-          bit       1, a
-          jr        z, .fdseek4
+          rra                           ; Busy bit into carry
+          jr        nc, .fdseek5        ; NC = done
+          rra                           ; DRQ bit into carry
+          jr        nc, .fdseek4        ; NC = not ready
           ld        c, d                ; Quicker than 3 INCs and 3 DECs
           in        a, (c)              ; Get it
           ld        (hl), a             ; (you'd think inir would work, but
@@ -951,15 +951,11 @@ fdcmplt:  ld        a, c                ; Shut off the drive
 ; Function to wait until the disk controller is ready.
 ; ----------------------------------------------------------------------------
 
-fdwait:   inc       c                   ; Status register
-          inc       c
-          inc       c
+fdwait:   ld        c, d                ; Status register
 .fdwait2: in        a, (c)
           bit       0, a
           jr        nz, .fdwait2
-          dec       c                   ; Data register
-          dec       c
-          dec       c
+          ld        c, e                ; Data register
 fdret:    ret
 
 ; ----------------------------------------------------------------------------
@@ -1258,7 +1254,7 @@ rdhcca2:  push      bc                  ; Save retry count
           ret       z
           jp        err
 
-banner:   db        "OpenNabu IPL v0.6.4  5-JUL-23", 0
+banner:   db        "OpenNabu IPL v0.6.5  5-JUL-23", 0
 bootmsg:  db        13, 10
           db        "Select boot device", 13, 10
           db        "[(F)loppy disk, (H)ard disk, (C)able]: ", 0
