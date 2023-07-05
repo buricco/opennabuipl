@@ -21,7 +21,7 @@
 
 ; ============================================================================
 ; OpenNabu IPL: Replacement for the Nabu Personal Computer firmware (mainly
-; for use by emulators, but works on metal also).  V0.6.3
+; for use by emulators, but works on metal also).  V0.6.4
 ;
 ; Space for a POST has been sacrificed in order to ensure that there is room
 ; to boot either the floppy subsystem (if installed) or the cable modem.  It
@@ -870,6 +870,9 @@ fdseek:   call      getfd
 .fdseek1: ld        a, c
           and       0xF0
           ld        c, a
+          ld        e, a                ; Save base port
+          add       3
+          ld        d, a                ; Save data port
           ld        a, 0xD0             ; IRQ the drive
           out       (c), a
           call      fdwait
@@ -911,14 +914,10 @@ fdseek:   call      getfd
           jr        z, .fdseek5
           bit       1, a
           jr        z, .fdseek4
-          inc       c
-          inc       c
-          inc       c
+          ld        c, d                ; Quicker than 3 INCs and 3 DECs
           in        a, (c)              ; Get it
           ld        (hl), a             ; (you'd think inir would work, but
-          dec       c                   ;  it's WAY too fast)
-          dec       c
-          dec       c
+          ld        c, e                ;  it's WAY too fast)
           inc       hl
           jr        .fdseek4
 .fdseek5: and       0x18
@@ -1259,7 +1258,7 @@ rdhcca2:  push      bc                  ; Save retry count
           ret       z
           jp        err
 
-banner:   db        "OpenNabu IPL v0.6.3 30-APR-23", 0
+banner:   db        "OpenNabu IPL v0.6.4  5-JUL-23", 0
 bootmsg:  db        13, 10
           db        "Select boot device", 13, 10
           db        "[(F)loppy disk, (H)ard disk, (C)able]: ", 0
