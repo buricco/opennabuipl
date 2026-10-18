@@ -9,3 +9,5 @@ it will try to reload from the last known device - but this also can be
 overridden with <Esc>.
 
 The assembler used to roll it is the "z80asm" in the Debian repos.
+
+Disclosure: a small floppy disk boot bug from 0.6.5 was fixed by GPT-6.1-Sol.
