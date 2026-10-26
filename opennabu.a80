@@ -22,7 +22,7 @@
 
 ; ============================================================================
 ; OpenNabu IPL: Replacement for the Nabu Personal Computer firmware (mainly
-; for use by emulators, but works on metal also).  V0.7.0
+; for use by emulators, but works on metal also).  V0.7.1
 ;
 ; Space for a POST has been sacrificed in order to ensure that there is room
 ; to boot either the floppy subsystem (if installed) or the cable modem.  It
@@ -107,6 +107,16 @@ entry2:   ld        hl, 0x0000          ; Shadow (or we exit to hyperspace)
           ldir
 
           ld        sp, 0xFFE0
+          ld        a, (warmflag)
+          cp        warmlo
+          jr        nz, entrycold
+          ld        a, (warmflag+1)
+          cp        warmhi
+          jr        nz, entrycold
+          ld        a, (iplmode)
+          cp        iplhcca
+          jp        z, warmhcca         ; Cable reset: clear display, resume cable.
+entrycold:
           call      setup               ; Initialize TTY
           call      bell                ; Ring the bell
           call      wrbanner            ; Draw logo in the corner of the screen
@@ -148,6 +158,7 @@ setup:    ld        c, 0x00             ; Bank out ROM, set only "Check" LED
           ld        a, 0x0B
           out       (c), a
           call      keyreset
+setupdisplay:
           ld        hl, txtregs         ; Setup video mode
           ld        d, 0x80
           ld        b, 0x08
@@ -1133,9 +1144,17 @@ tryhcca:  di                            ; uh, didn't we do this already?
           inc       b
           jp        .getload
 
+warmhcca: ld        c, 0x00
+          ld        a, 0x0B
+          out       (c), a
+          call      setupdisplay        ; No keyboard reset, banner or boot delay.
+          jp        tryhcca
+
 hccmplt:  ld        c, 0x00             ; Hide the ROM (we're under it still)
           ld        a, 0x03             ;   (Nabu does this much sooner)
           out       (c), a
+          ld        a, iplhcca
+          ld        (iplmode), a        ; Remember cable for the next warm reset.
           jp        0x1410              ; Enter boot sector
 
 scream2:  jp        err
@@ -1255,7 +1274,7 @@ rdhcca2:  push      bc                  ; Save retry count
           ret       z
           jp        err
 
-banner:   db        "OpenNabu IPL v0.7.0 18-OCT-26", 0
+banner:   db        "OpenNabu IPL v0.7.1 26-OCT-26", 0
 bootmsg:  db        13, 10
           db        "Select boot device", 13, 10
           db        "[(F)loppy disk, (H)ard disk, (C)able]: ", 0
@@ -1356,7 +1375,7 @@ font:     db        0x00, 0x00, 0x00, 0x04, 0x00, 0x1C, 0x3C, 0x00    ; Logo
           db        0x00, 0xF0, 0xE0, 0x00, 0x80, 0x00, 0x00, 0x00    ; Logo
           db        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00    ; ' '
           db        0x20, 0x20, 0x20, 0x20, 0x20, 0x00, 0x20, 0x00    ; '!'
-          db        0x50, 0x50, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00    ; '"'
+          db        0x28, 0x28, 0x50, 0x00, 0x00, 0x00, 0x00, 0x00    ; '"'
           db        0x50, 0x50, 0xF8, 0x50, 0xF8, 0x50, 0x50, 0x00    ; '#'
           db        0x20, 0x70, 0x80, 0x70, 0x08, 0x70, 0x20, 0x00    ; '$'
           db        0x00, 0x88, 0x10, 0x20, 0x40, 0x88, 0x00, 0x00    ; '%'
